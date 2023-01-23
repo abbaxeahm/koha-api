@@ -1,0 +1,198 @@
+<?php // -*- mode: php; -*-
+// vim: ft=php ts=2 sw=2 et
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Credentials: true");
+
+if($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
+  header("Access-Control-Allow-Headers: Origin, Content-Type, Accept, X-Requested-With");
+  header("Access-Control-Max-Age: 86400");
+  header("Cache-Control: public, max-age=86400");
+  header("Vary: origin");
+  exit(0);
+}
+
+switch($_SERVER["CONTENT_TYPE"]) {
+case "application/json":
+  $data = json_decode(file_get_contents("php://input"), true);
+  break;
+
+default:
+  parse_str(file_get_contents("php://input"), $data);
+  break;
+}
+
+mb_internal_encoding("utf-8");
+$whereStatements = array();
+$sql_vars = array();
+$sql_var_types = '';
+
+$api_vars = preg_split("/\//", ltrim($_SERVER["PATH_INFO"], '/'));
+parse_str($_SERVER["QUERY_STRING"], $query_vars);
+
+// Filter out empty variables
+$api_vars = array_filter($api_vars, static function($var){return $var !== NULL && $var !== "";} );
+
+function get_where_statement_query_list($queryname){
+  global $whereStatements, $query_vars, $sql_vars, $sql_var_types;
+  if(isset($query_vars[$queryname])){
+      $whereStatement = "$queryname IN (";
+      foreach(explode(",", $query_vars[$queryname]) as $var){
+        $whereStatement .= '?, ';
+        $sql_vars[] = $var;
+        $sql_var_types .= "s";
+      }
+      $whereStatements[] = substr($whereStatement, 0, -2) . ")";
+
+  }
+}
+
+  mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+  $dbhost = "localhost";
+  $dbuser = "http";
+  $dbpass = "";
+  $dbname = $data["db"]??"koha_test2";
+
+  try {
+  $conn = new mysqli($dbhost, $dbuser, $dbpass, $dbname);
+  } catch(mysqli_sql_exception $e) {
+    http_response_code(500);
+    die(($data["html"]??false)
+        ? "Could not connect to database<br />\n<pre>${e}</pre>"
+        : "Could not connect to database\n${e}");
+  }
+
+switch("{$_SERVER["REQUEST_METHOD"]} {$api_vars[0]}"){
+case "GET data":
+    $join = "";
+  if(!isset($query_vars["table"])){
+    $query_vars["table"] = "statistics";
+  }
+    //print_r($query_vars);
+    switch($query_vars["table"]){
+      case "branchtransfers":
+        $xValue = "";
+        if(isset($query_vars["barChart"])){
+          $xValue = $query_vars["barChart"];
+        }
+        $yValue = "COUNT(t.itemnumber)";
+        $dateColumn = (isset($query_vars["dateColumn"])) ? "t.{$query_vars["dateColumn"]}" : "datearrived";
+        get_where_statement_query_list("frombranch");
+        get_where_statement_query_list("tobranch");
+        break;
+      case "statistics":
+      default:
+        $xValue = "";
+        $yValue = "COUNT(t.itemnumber)";
+        $dateColumn = "t.datetime";
+        get_where_statement_query_list("branch");
+        get_where_statement_query_list("type");
+        get_where_statement_query_list("itemtype");
+    }
+
+    
+    if(!isset($query_vars["barChart"])){
+    switch ($query_vars["timeScale"]??false) {
+    case "day":
+      $xValue = "DATE_FORMAT($dateColumn,'%Y-%m-%d')";
+      break;
+    case "week":
+      $xValue = "INTERVAL WEEK($dateColumn,3) WEEK + DATE_FORMAT($dateColumn,'%Y-01-01')";
+      break;
+    case "month":
+      $xValue = "DATE_FORMAT($dateColumn,'%Y-%m-01')";
+      break;
+    case "year":
+      $xValue = "DATE_FORMAT($dateColumn,'%Y-01-01')";
+      break;
+    default: $xValue = $dateColumn;
+    }  
+    }
+    $sql = "SELECT $yValue AS y, $xValue AS x FROM {$query_vars["table"]} AS t";
+    // $sql_vars []= $query_vars["table"];
+    // $sql_var_types .= "s";
+    if(isset($query_vars["title"]) | isset($query_vars["author"])){
+        $biblioJoinOn = "";
+        if(isset($query_vars["author"])){
+          $biblioJoinOn .= " AND b.author = ?";
+          $sql_vars[] = $query_vars["author"];
+          $sql_var_types += "s";
+        }
+        if(isset($query_vars["title"])){
+          $biblioJoinOn .= " AND b.title = ?";
+          $sql_vars[] = $query_vars["title"];
+          $sql_var_types += "s";
+        }
+        $join = " INNER JOIN items AS i ON (t.itemnumber = i.itemnumber) INNER JOIN biblio AS b ON (i.biblionumber = b.biblionumber$biblioJoinOn)";
+      }
+    if(isset($query_vars["fromDate"]) & isset($query_vars["toDate"])){
+        $whereStatements[] = "$dateColumn BETWEEN '{$query_vars["fromDate"]}' AND '{$query_vars["toDate"]}'";
+        $sql_vars[] = $query_vars["fromDate"];
+        $sql_vars[] = $query_vars["toDate"];
+        $sql_var_types += "ss";
+    } else{
+      $whereStatements[] = "!ISNULL($dateColumn)";
+    }
+
+    $sql .=  $join;
+    $sql .= ((count($whereStatements) == 0)? "" : " WHERE ") . implode(" AND ", $whereStatements) . " GROUP BY x ORDER BY x";
+    //print_r($sql);
+    $stmt = $conn->prepare($sql);
+    if($sql_var_types != ""){
+      $stmt->bind_param($sql_var_types, ...$sql_vars);
+    }
+    $stmt->execute();    
+    $result = $stmt->get_result();
+    $rows = array();
+    foreach($result as $row){
+        $rows[] = $row;
+    }
+    echo json_encode($rows);
+    break;
+
+case "GET branches":
+
+  $result = $conn->query("SELECT branchcode AS value, branchname AS label FROM branches");
+  $rows = array();
+  foreach($result as $row){
+    $rows[] = $row;
+  }
+  echo json_encode($rows);
+  break;
+
+case "GET itemtypes":
+  $result = $conn->query("SELECT DISTINCT itemtype FROM statistics WHERE !ISNULL(itemtype) AND itemtype != ''");
+  $rows = array();
+  foreach($result as $row){
+    $rows[] = $row["itemtype"];
+  }
+  echo json_encode($rows);
+  break;
+    
+case "POST ":
+  try {
+    $result = $conn->query($data["query"]);
+  } catch(mysqli_sql_exception $e) {
+    http_response_code(500);
+    die(($data["html"]??false) ? "<pre>${e}</pre>" : $e);
+  }
+  if($result) {
+    $rows = array();
+    foreach($result as $row) {
+      $rows[] = $row;
+    }
+
+    if($data["table"]??false) {
+      print_table($result, $data);
+    } else {
+      header("Content-Type: application/json");
+      echo json_encode($rows);
+    }
+  } else {
+    header("Content-Type: application/json");
+    echo json_encode($result);
+  }
+
+  die();
+}
+?>
